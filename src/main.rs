@@ -1,14 +1,17 @@
 mod context;
+mod html_checker;
 
-use std::{str::FromStr, time::Duration};
+use std::{pin::Pin, str::FromStr, sync::Arc, time::Duration};
 
 use context::Context;
 
 use async_recursion::async_recursion;
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{stream::FuturesUnordered, Future, StreamExt};
 use soup::prelude::*;
 use tokio::time::sleep;
 use url::{ParseError::RelativeUrlWithoutBase, Url};
+
+use crate::context::ContextState;
 
 fn main() {
 	tokio::runtime::Builder::new_multi_thread()
@@ -16,30 +19,35 @@ fn main() {
 		.build()
 		.unwrap()
 		.block_on(async {
-			let ctx = Context::new();
 			let url =
 				Url::from_str("https://en.wikipedia.org/wiki/Cocaine").unwrap();
 			let title = "Nun".into();
 
-			let route = scan_page(&ctx, url, title, 0).await;
+			let ctx = Context::new(title, url);
+			ctx.start();
+
+			loop {
+				if let ContextState::Finished(path) = ctx.get_status() {}
+			}
 
 			println!("found route:");
-			for url in route.iter().rev().enumerate() {
+			for url in route.unwrap().iter().rev().enumerate() {
 				println!("{}: {}", url.0, url.1);
 			}
 		});
 }
 
-#[async_recursion]
+#[derive(Debug)]
+enum ScanError {
+	UrlExistsInContext,
+}
+
 async fn scan_page(
-	ctx: &Context,
+	ctx: Arc<Context>,
 	url: Url,
 	page_title: String,
 	distance: usize,
-) -> Vec<Url> {
-	println!("new scan at: {}", url);
-	// println!("for title: {}", page_title);
-	println!("with distance: {}", distance);
+) {
 	ctx.ring_start(distance).await;
 
 	while !ctx.can_run(distance).await {
@@ -47,100 +55,68 @@ async fn scan_page(
 		sleep(Duration::from_millis(100)).await;
 	}
 
-	println!("[{}] can now scan", url);
+	if ctx.cache_has_url(&url).await {
+		return;
+	}
 
-	let req = reqwest::get(url.clone()).await.unwrap();
-
-	println!("[{}] got response", url);
-
-	let html_string = req.text().await.unwrap();
-
+	// clean up all computation artefacts when done
 	let scan_result = {
-		let html = Soup::new(&html_string);
-
-		println!("[{}] parsed html", url);
-
-		let title = html
-			.recursive(true)
-			.tag("span")
-			.find_all()
-			.map(|el| el.children().next().map(|n| n.text()))
-			.collect::<Vec<_>>()[0]
-			.clone();
-
-		println!("got title: {:?}", title);
-
-		let title_matches = title.clone().map_or(false, |v| v == page_title);
-
-		println!("[{}] title matches? {}", url, title_matches);
-
-		if title_matches {
-			Ok(title.unwrap())
-		} else {
-			let nodes = html
-				.recursive(true)
-				.tag("a")
-				.attr_name("href")
-				.find_all()
-				.filter_map(|el| {
-					let attrs = el.attrs();
-					let href = attrs["href"].as_str();
-
-					let mut url_res = Url::parse(href);
-
-					if let Err(RelativeUrlWithoutBase) = url_res {
-						let base_url = Url::parse("https://en.wikipedia.org/")
-							.expect("base url is wrong");
-						url_res = base_url.join(href);
-					}
-
-					if let Ok(url) = url_res {
-						let valid =
-							url.host().is_some()
-								&& url
-									.host()
-									.expect("This should no longer execute")
-									.to_string() == "en.wikipedia.org"
-								&& url.query().is_none() && url
-								.fragment()
-								.is_none() && !url.path().contains('#')
-								&& !url.path().contains(':') && !url
-								.path()
-								.contains('.') && !url.path().contains("Main_Page");
-						// println!("checking url validity: {} {}", url, valid);
-						if valid {
-							Some(url)
-						} else {
-							None
-						}
-					} else {
-						None
-					}
-				})
-				.map(|url| {
-					scan_page(ctx, url, page_title.clone(), distance + 1)
-				})
-				.collect::<FuturesUnordered<_>>();
-
-			println!("valid paths: {}", nodes.len());
-			Err(nodes)
-		}
+		let html_string = get_html(&url).await;
+		test_page(ctx.clone(), html_string, page_title, distance)
 	};
 
-	println!("[{}] ring finished", url);
 	ctx.ring_finish(distance).await;
 
 	match scan_result {
-		Ok(_title) => {
-			vec![url]
-		}
+		Ok(_title) => Ok(vec![url]),
 		Err(mut scan_result) => {
-			let mut path = scan_result
-				.next()
-				.await
-				.expect("somehow came to the end of iterator?");
+			loop {
+				if let Err(err) = next_page_result {
+					break;
+				}
+
+				let Ok(vec) = next_page_result;
+			}
+
+			let Ok(mut path) = path else {
+				return path;
+			};
+
 			path.append(&mut vec![url]);
-			path
+
+			Ok(path)
 		}
 	}
+}
+
+async fn get_html(url: &Url) -> String {
+	loop {
+		let req_res = reqwest::get(url.clone()).await;
+
+		let Ok(res) = req_res else {
+			println!("[{}] got error when requesting page", url);
+			continue;
+		};
+
+		if let Ok(html_string) = res.text().await {
+			break html_string;
+		};
+
+		println!("[{}] got error when requesting page", url);
+		sleep(Duration::from_millis(100)).await;
+	}
+}
+
+fn check_title() -> bool {
+	let title = html
+		.recursive(true)
+		.tag("span")
+		.find_all()
+		.map(|el| el.children().next().map(|n| n.text()))
+		.collect::<Vec<_>>()[0]
+		.clone();
+
+	// println!("got title: {:?}", title);
+
+	let title_matches = title.clone().map_or(false, |v| v == page_title);
 }
